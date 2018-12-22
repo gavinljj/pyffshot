@@ -1,0 +1,13 @@
+.idea
+*.pyc
+logs/
+*.log
+*.jpg
+*.jpeg
+core
+shot
+*.o
+dist/
+*.un~
+build
+pyffshot.egg-info/
