@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 from ctypes import cdll
 import os
+import time
 import sys
 __path = os.path.dirname(os.path.abspath(__file__))
 cdll.LoadLibrary(__path + "/lib/libavutil.so")
@@ -29,4 +30,6 @@ if __name__ == "__main__":
     if len(sys.argv) < 3:
         print "Usage:\n\tpython shot.py URL IMAGE_PATH\n"
         exit(-1)
-    shot(sys.argv[1], sys.argv[2])
+    while True:    
+        shot(sys.argv[1], sys.argv[2])
+        time.sleep(0.5)

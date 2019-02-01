@@ -1,5 +1,5 @@
 #include "shot.h"
-
+#include <time.h>
 
 /**
  * 从视频中获取第一个关键帧作为视频截图
@@ -18,6 +18,7 @@ int shot(const char *url, const char *codec_name, const char *output, int timeou
     av_init_packet(&packet);
     packet.data = NULL;
     packet.size = 0;
+    long last = (long) time(NULL), now;
     while (av_read_frame(shot_ctx->iformat_ctx, &packet) >= 0) {
         if (packet.stream_index == shot_ctx->video_stream_index) {
             av_packet_rescale_ts(&packet,
@@ -32,6 +33,13 @@ int shot(const char *url, const char *codec_name, const char *output, int timeou
                 return 0;
             }
         }
+        av_packet_unref(&packet);
+        now = (long) time(NULL);
+        if ((now - last) * 1000 >= timeout) {
+            printf("shot expire timeout: %s\n", url);
+            break;
+        }
+        last = now;
     }
     av_packet_unref(&packet);
     close_shot_context(shot_ctx);
@@ -48,6 +56,15 @@ int shot(const char *url, const char *codec_name, const char *output, int timeou
  */
 ShotContext *open_shot_context(const char *url, const char *codec_name, const char *output, int timeout) {
     ShotContext *shot_ctx = (ShotContext *) malloc(sizeof(ShotContext));
+    shot_ctx->iformat_ctx = NULL;
+    shot_ctx->encodec_ctx= NULL;
+    shot_ctx->filter_ctx = NULL;
+    shot_ctx->decodec_ctx = NULL;
+    shot_ctx->oformat_ctx = NULL;
+    shot_ctx->packets = NULL;
+    shot_ctx->filtered_frames = NULL;
+    shot_ctx->frames=NULL;
+    shot_ctx->options = NULL;
     if (shot_ctx == NULL) {
         printf("av_mallocz_array failed\n");
         return NULL;
@@ -56,12 +73,13 @@ ShotContext *open_shot_context(const char *url, const char *codec_name, const ch
     shot_ctx->url = url;
     shot_ctx->options = NULL;
     if (timeout > 0) {
-        av_dict_set_int(&(shot_ctx->options), "timeout", timeout * 1000, 0);
+        av_dict_set_int(&(shot_ctx->options), "stimeout", timeout * 1000, 0);
     }// 打开input AVFormatContext
     int video_stream_index;
     AVFormatContext *iformat_ctx = NULL;
     if (open_iformat_context(url, &iformat_ctx, &(shot_ctx->options), &video_stream_index) < 0) {
         printf("open_iformat_context failed\n");
+        close_shot_context(shot_ctx);
         return NULL;
     }
     shot_ctx->iformat_ctx = iformat_ctx;
@@ -70,6 +88,7 @@ ShotContext *open_shot_context(const char *url, const char *codec_name, const ch
     AVCodecContext *decodec_ctx = NULL;
     if (open_decodec_context(iformat_ctx, video_stream_index, &decodec_ctx) < 0) {
         printf("open deocodec context failed\n");
+        close_shot_context(shot_ctx);
         return NULL;
     }
     shot_ctx->decodec_ctx = decodec_ctx;
@@ -79,6 +98,7 @@ ShotContext *open_shot_context(const char *url, const char *codec_name, const ch
     AVCodecContext *encodec_ctx = NULL;
     if (open_encodec_context(shot_ctx->codec_name, decodec_ctx, &encodec_ctx) < 0) {
         printf("open encodec context failed\n");
+        close_shot_context(shot_ctx);
         return NULL;
     }
     shot_ctx->encodec_ctx = encodec_ctx;
@@ -88,6 +108,7 @@ ShotContext *open_shot_context(const char *url, const char *codec_name, const ch
     if (open_filter_context(decodec_ctx, encodec_ctx, &filter_ctx,
                             decodec_ctx->codec_type == AVMEDIA_TYPE_VIDEO ? "null" : "anull") < 0) {
         printf("open_filter_context failed\n");
+        close_shot_context(shot_ctx);
         return NULL;
     }
     shot_ctx->filter_ctx = filter_ctx;
@@ -95,6 +116,7 @@ ShotContext *open_shot_context(const char *url, const char *codec_name, const ch
     AVFormatContext *oformat_ctx = NULL;
     if (open_oformat_context(output, encodec_ctx, &oformat_ctx) < 0) {
         printf("open_oformat_context failed\n ");
+        close_shot_context(shot_ctx);
         return NULL;
     }
     shot_ctx->oformat_ctx = oformat_ctx;
@@ -107,27 +129,45 @@ ShotContext *open_shot_context(const char *url, const char *codec_name, const ch
 }
 
 void close_shot_context(ShotContext *shot_ctx) {
-    if (shot_ctx->oformat_ctx && !(shot_ctx->oformat_ctx->oformat->flags & AVFMT_NOFILE)) {
-        avio_closep(&(shot_ctx->oformat_ctx->pb));
+    if (shot_ctx->oformat_ctx) {
+        if (!(shot_ctx->oformat_ctx->oformat->flags & AVFMT_NOFILE)) {
+            avio_closep(&(shot_ctx->oformat_ctx->pb));
+        }
+        avformat_free_context(shot_ctx->oformat_ctx);
     }
-    avcodec_free_context(&(shot_ctx->decodec_ctx));
-    avcodec_free_context(&(shot_ctx->encodec_ctx));
-    avfilter_graph_free(&(shot_ctx->filter_ctx->filter_graph));
-    free(shot_ctx->filter_ctx);
-    avformat_free_context(shot_ctx->oformat_ctx);
-    avformat_close_input(&(shot_ctx->iformat_ctx));
-    while(!is_empty_queue(shot_ctx->frames)) {
-        av_frame_free(pop_queue(shot_ctx->frames));
+    if (shot_ctx->decodec_ctx) {
+        avcodec_free_context(&(shot_ctx->decodec_ctx));
     }
-    while (!is_empty_queue(shot_ctx->filtered_frames)) {
-        av_frame_free(pop_queue(shot_ctx->filtered_frames));
+    if (shot_ctx->encodec_ctx) {
+        avcodec_free_context(&(shot_ctx->encodec_ctx));
     }
-    while (!is_empty_queue(shot_ctx->packets)) {
-        av_packet_free(pop_queue(shot_ctx->packets));
+    if (shot_ctx->filter_ctx) {
+        if (shot_ctx->filter_ctx->filter_graph) {
+            avfilter_graph_free(&(shot_ctx->filter_ctx->filter_graph));
+        }
+        free(shot_ctx->filter_ctx);
     }
-    destroy_queue(shot_ctx->frames);
-    destroy_queue(shot_ctx->filtered_frames);
-    destroy_queue(shot_ctx->packets);
+    if (shot_ctx->iformat_ctx) {
+        avformat_close_input(&(shot_ctx->iformat_ctx));
+    }
+    if (shot_ctx->frames) {
+        while (!is_empty_queue(shot_ctx->frames)) {
+            av_frame_free(pop_queue(shot_ctx->frames));
+        }
+        destroy_queue(shot_ctx->frames);
+    }
+    if (shot_ctx->filtered_frames) {
+        while (!is_empty_queue(shot_ctx->filtered_frames)) {
+            av_frame_free(pop_queue(shot_ctx->filtered_frames));
+        }
+        destroy_queue(shot_ctx->filtered_frames);
+    }
+    if (shot_ctx->packets) {
+        while (!is_empty_queue(shot_ctx->packets)) {
+            av_packet_free(pop_queue(shot_ctx->packets));
+        }
+        destroy_queue(shot_ctx->packets);
+    }
     if (shot_ctx->options) {
         av_dict_free(&(shot_ctx->options));
     }
@@ -469,6 +509,7 @@ int decode_packet(ShotContext *shot_ctx, AVPacket *packet) {
     int ret;
     if ((ret = avcodec_send_packet(shot_ctx->decodec_ctx, packet)) < 0) {
         printf("avcodec_send_packet failed, %s\n", av_err2str(ret));
+
         return ret;
     }
     AVFrame *frame = NULL;
@@ -480,11 +521,13 @@ int decode_packet(ShotContext *shot_ctx, AVPacket *packet) {
         }
         ret = avcodec_receive_frame(shot_ctx->decodec_ctx, frame);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            av_frame_free(&frame);
             return 0;
         } else if (ret < 0) {
             printf("avcodec_receive_frame failed, %s\n", av_err2str(ret));
+            av_frame_free(&frame);
             return ret;
-        } else if (frame->key_frame == 1) {
+        } else {
             frame->pts = frame->best_effort_timestamp;
             push_queue(shot_ctx->frames, frame);
         }
@@ -521,15 +564,16 @@ int filter_packet(ShotContext *shot_ctx, AVFrame *frame) {
         ret = av_buffersink_get_frame(shot_ctx->filter_ctx->buffersink_ctx, filtered_frame);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
             ret = 0;
+            av_frame_free(&filtered_frame);
             goto end;
         } else if (ret < 0) {
             printf("av_buffersink_get_frame failed, %s\n", av_err2str(ret));
+            av_frame_free(&filtered_frame);
             goto end;
         } else {
             filtered_frame->pict_type = AV_PICTURE_TYPE_NONE;
             push_queue(shot_ctx->filtered_frames, filtered_frame);
         }
-
     }
     end:
     av_frame_free(&frame);
@@ -563,9 +607,11 @@ int encode_packet(ShotContext *shot_ctx, AVFrame *frame) {
         ret = avcodec_receive_packet(shot_ctx->encodec_ctx, packet);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
             ret = 0;
+            av_packet_free(&packet);
             goto end;
         } else if (ret < 0) {
             printf("avcodec_receive_packet failed, %s\n", av_err2str(ret));
+            av_packet_free(&packet);
             goto end;
         } else {
             push_queue(shot_ctx->packets, packet);
@@ -591,6 +637,7 @@ void mux_oformat_packets(ShotContext *shot_ctx) {
                packet->size);
         ret = av_interleaved_write_frame(shot_ctx->oformat_ctx, packet);
         av_write_trailer(shot_ctx->oformat_ctx);
+        av_packet_free(&packet);
         return;
     }
 }
